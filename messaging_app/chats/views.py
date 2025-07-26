@@ -1,15 +1,32 @@
-from django.shortcuts import render
-from rest_framework import viewsets,filters,status
-from .models import User,Message,Conversation
-from .serializers import UserSerializer,MessageSerializer,ConversationSerializer
-from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
+from rest_framework import viewsets, filters, status
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework import permissions
+from .models import User, Message, Conversation
+from .serializers import UserSerializer, MessageSerializer, ConversationSerializer
+from .permissions import IsParticipantOfConversation
+from .filters import MessageFilter
+from .pagination import MessagePagination
+from django_filters.rest_framework import DjangoFilterBackend
 
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+
+    def get_permissions(self):
+        if self.action == 'create':
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
 class ConversationViewSet(viewsets.ModelViewSet):
-    queryset=Conversation.objects.all()
-    serializer_class=ConversationSerializer
+    permission_classes = (IsAuthenticated, IsParticipantOfConversation)
+
+    serializer_class = ConversationSerializer
     filter_backends = [filters.SearchFilter]
     search_fields = ['participants__email', 'participants__first_name']
+
+    def get_queryset(self):
+        return Conversation.objects.filter(participants=self.request.user)
 
     def create(self, request, *args, **kwargs):
         participant_ids = request.data.get('participants', [])
@@ -28,26 +45,43 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.participants.set(participants)
         serializer = self.get_serializer(conversation)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
 class MessageViewSet(viewsets.ModelViewSet):
-    queryset=Message.objects.all()
-    serializer_class=MessageSerializer
+    permission_classes = (IsAuthenticated, IsParticipantOfConversation)
+    serializer_class = MessageSerializer
     filter_backends = [filters.OrderingFilter]
     ordering_fields = ['sent_at']
     ordering = ['-sent_at']
+
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_class = MessageFilter
+    pagination_class = MessagePagination
+    def get_queryset(self):
+        print("===> Request User:", self.request.user)
+        print("===> Request Auth:", self.request.auth)
+        qs = Message.objects.filter(conversation__participants=self.request.user)
+        print(f"User {self.request.user} can access messages: {[m.message_body for m in qs]}")
+        return qs
     
     def create(self, request, *args, **kwargs):
         conversation_id = request.data.get('conversation')
         message_body = request.data.get('message_body')
-        sender_id = request.data.get('sender')  # assuming sender is passed explicitly
+        sender = request.user  # Secure: Don't take sender from request
 
-        if not conversation_id or not message_body or not sender_id:
+        if not conversation_id or not message_body:
             return Response(
-                {"error": "conversation, message_body, and sender fields are required."},
+                {"error": "conversation and message_body fields are required."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         conversation = get_object_or_404(Conversation, conversation_id=conversation_id)
-        sender = get_object_or_404(User, user_id=sender_id)
+
+        if sender not in conversation.participants.all():
+            return Response(
+                {"error": "You are not a participant in this conversation."},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         message = Message.objects.create(
             sender=sender,
